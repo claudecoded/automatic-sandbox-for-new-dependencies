@@ -1,0 +1,101 @@
+name: Dependency Sandbox Security Scanner
+
+on:
+  pull_request:
+    paths:
+      - 'package.json'
+      - 'package-lock.json'
+      - 'requirements.txt'
+      - 'pnpm-lock.yaml'
+      - 'yarn.lock'
+
+permissions:
+  contents: read
+  pull-requests: write
+
+jobs:
+  sandbox-analysis:
+    name: Analyze New Dependencies in Sandbox
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout Repository
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Setup Node.js Environment
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Install Socket CLI
+        run: npm install -g @socketsecurity/cli
+
+      - name: Run Safe Sandbox Behavior Scan
+        id: socket-scan
+        env:
+          SOCKET_SECURITY_API_KEY: \${{ secrets.SOCKET_SECURITY_API_KEY }}
+        run: |
+          echo "Starting dynamic and behavioral analysis of changed packages..."
+          
+          # Runs the scan and outputs the telemetry/risk report
+          # It detects network calls, environment variable access, and telemetry scripts
+          socket cli scan --json > socket_report.json || true
+          
+          echo "Sandbox analysis completed. Processing results..."
+
+      - name: Evaluate Security Risks and Block PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const reportPath = './socket_report.json';
+            
+            if (!fs.existsSync(reportPath)) {
+              core.setFailed('Sandbox analysis report not found.');
+              return;
+            }
+
+            const report = JSON.parse(fs.readFileSync(reportPath, 'utf8'));
+            let dynamicAnalysisIssues = [];
+
+            // Critical alerts to catch in the sandbox
+            const criticalAlerts = [
+              'envVars',          // Attempts to read process.env / system secrets
+              'networkAccess',    // Suspicious outbound network connections
+              'shellExecution',   // Spawning unauthorized shell processes
+              'telemetry'         // Hidden telemetry or exfiltration scripts
+            ];
+
+            // Parsing the issues found by the dynamic scanner
+            if (report.issues && report.issues.length > 0) {
+              dynamicAnalysisIssues = report.issues.filter(issue => 
+                criticalAlerts.includes(issue.type) && issue.severity === 'high'
+              );
+            }
+
+            if (dynamicAnalysisIssues.length > 0) {
+              let commentBody = `### 🚨 Malicious Dependency Behavior Detected in Sandbox!\n\n`;
+              commentBody += `The sandbox monitor intercepted suspicious behavior from a newly introduced package:\n\n`;
+              
+              dynamicAnalysisIssues.forEach(issue => {
+                commentBody += `- **Package:** \`\${issue.pkg}\`\n`;
+                commentBody += `  - **Risk Category:** \`\${issue.type}\`\n`;
+                commentBody += `  - **Description:** ${issue.description}\n\n`;
+              });
+              
+              commentBody += `⚠️ **Action Required:** This Pull Request has been automatically blocked from merging to prevent Supply Chain Attacks. Please review or remove these dependencies.`;
+
+              // Post the security alert directly onto the Pull Request
+              await github.rest.issues.createComment({
+                issue_number: context.issue.number,
+                owner: context.repo.owner,
+                repo: context.repo.repo,
+                body: commentBody
+              });
+
+              core.setFailed('Merge blocked: New dependencies failed sandbox behavior validation.');
+            } else {
+              console.log('Sandbox analysis passed. No malicious runtime behaviors detected.');
+            }
